@@ -1,0 +1,221 @@
+# NorthStar Logistics — Model Registry Specification
+# Version: 1.0.0
+# Last updated: 2025-01
+# Owner: ML Platform team
+
+registry:
+  name: northstar-models
+  backend: mlflow          # MLflow Tracking Server + Model Registry
+  artifact_store: s3://northstar-mlflow-artifacts/   # versioned bucket
+  ui_url: https://mlflow.internal.northstar.io
+
+  stages:
+
+    - name: staging
+      promoted_from: >
+        A training run whose eval_report.json is logged to MLflow and all
+        numeric gates below pass. Promotion is triggered automatically by
+        the post-training CI job via `mlflow.register_model()`.
+      promotion_rule: automatic
+      gates:
+        # Regression quality — ETA model
+        - id: rmse_overall
+          description: >
+            Holdout RMSE on the frozen evaluation set (split_manifest.json)
+            must be ≤ 8.5 minutes. Evaluated on the last 60 days of
+            delivery events, excluding public-holiday weeks.
+          metric: eval/rmse_minutes
+          threshold: "<= 8.5"
+          model: eta
+
+        - id: rmse_per_city_bottom3
+          description: >
+            RMSE for the 3 lowest-performing cities (by volume) in the
+            holdout set must each be ≤ 12.0 minutes. Prevents silent
+            degradation on sparse routes.
+          metric: eval/rmse_bottom3_cities_max
+          threshold: "<= 12.0"
+          model: eta
+
+        # Classification quality — Dispatcher model
+        - id: macro_f1_overall
+          description: >
+            Macro-averaged F1 on the frozen dispatcher holdout set
+            must be ≥ 0.82.
+          metric: eval/macro_f1
+          threshold: ">= 0.82"
+          model: dispatcher-routing
+
+        - id: f1_per_city_bottom3
+          description: >
+            Per-city F1 for the 3 lowest-performing cities must each
+            be ≥ 0.70.
+          metric: eval/f1_bottom3_cities_min
+          threshold: ">= 0.70"
+          model: dispatcher-routing
+
+        # Cross-model gates (both models)
+        - id: schema_compatibility
+          description: >
+            Model input/output schema (schema.json embedded in the ONNX
+            metadata) must be backward-compatible with the current
+            production serving contract. Checked by `schema_diff.py`
+            in CI — any breaking field removal or type change blocks
+            promotion.
+          check: schema_diff --mode=strict
+          result: no_breaking_changes
+
+        - id: inference_latency_p95
+          description: >
+            p95 inference latency measured on 1,000 sample requests
+            against a single-replica staging server must be ≤ 100 ms
+            (ETA) / ≤ 60 ms (Dispatcher). This is 2/3 of the SLA to
+            leave headroom for network and pre/post-processing.
+          metric: bench/p95_latency_ms
+          threshold:
+            eta: "<= 100"
+            dispatcher-routing: "<= 60"
+
+        - id: unit_tests
+          description: >
+            All tests in tests/model/ must pass. Includes: input
+            boundary checks, null-feature handling, output range
+            assertions (ETA > 0, dispatcher output is a valid courier_id).
+          check: pytest tests/model/ --tb=short
+          result: exit_code_0
+
+    - name: production
+      promoted_from: staging
+      promotion_rule: manual
+      gates:
+        - id: canary_latency
+          description: >
+            During a 30-minute canary window at 5 % traffic, the p95
+            end-to-end API latency (measured by Prometheus at the
+            ingress, not the model server) must remain ≤ 150 ms (ETA)
+            / ≤ 80 ms (Dispatcher).
+          metric: prometheus/api_p95_latency_ms
+          window_minutes: 30
+          threshold:
+            eta: "<= 150"
+            dispatcher-routing: "<= 80"
+
+        - id: canary_error_rate
+          description: >
+            HTTP 5xx error rate during the canary window must be
+            < 0.1 % of requests.
+          metric: prometheus/error_rate_pct
+          window_minutes: 30
+          threshold: "< 0.1"
+
+        - id: canary_prediction_distribution
+          description: >
+            The KL-divergence between canary prediction distribution and
+            the last 7-day production distribution must be < 0.05.
+            Catches silent model pathologies before full rollout.
+          metric: evidently/prediction_kl_divergence
+          threshold: "< 0.05"
+
+        - id: business_sign_off
+          description: >
+            A product/ops stakeholder confirms no known operational
+            events (warehouse migrations, new city launches) that would
+            invalidate the evaluation set for this period.
+          check: manual_checklist
+          form: .github/PROMOTION_CHECKLIST.md
+
+      approvers:
+        - ml_lead          # reviews eval_report.json and canary metrics
+        - ops_lead         # confirms operational readiness and rollback plan
+        # Both must approve in GitHub PR; single approval is insufficient.
+
+    - name: archived
+      promoted_from: >
+        Automatic when a new model version reaches PRODUCTION, the
+        previous PRODUCTION version transitions to ARCHIVED.
+        Also triggered manually by any approver when a version is
+        found to have a data leak or critical bug.
+      retention_policy:
+        keep_last_n_versions: 10   # per model
+        hard_delete_after_days: 365
+        # Artifacts (weights + metadata) kept in S3 Glacier after
+        # registry entry is deleted for compliance.
+
+# ── MODEL DEFINITIONS ──────────────────────────────────────────────────────────
+
+models:
+  - name: eta
+    description: Predicts delivery arrival time in minutes from pickup event.
+    owner: ml-team           # GitHub team slug
+    oncall: ml-oncall        # PagerDuty schedule
+    inference_type: online
+    rps_p99: 200
+    sla_p95_ms: 150
+    framework: onnx
+    input_schema: schemas/eta_input_v1.json
+    output_schema: schemas/eta_output_v1.json
+    retrain_cadence: biweekly   # Airflow DAG: eta_retrain, every 14 days
+    retention_versions: 10
+    monitoring:
+      feature_drift_metric: PSI
+      drift_threshold: 0.2          # triggers automatic re-train DAG
+      prediction_spike_threshold_pct: 20  # RMSE increase vs 7-day baseline
+      alert_channel: "#ml-alerts"
+
+  - name: dispatcher-routing
+    description: >
+      Assigns incoming pickup requests to the optimal available courier.
+      Multi-class classification over active courier pool.
+    owner: ml-team
+    oncall: ml-oncall
+    inference_type: online
+    rps_p99: 50
+    sla_p95_ms: 80
+    framework: onnx
+    input_schema: schemas/dispatcher_input_v1.json
+    output_schema: schemas/dispatcher_output_v1.json
+    retrain_cadence: monthly    # Airflow DAG: dispatcher_retrain, 1st of month
+    retention_versions: 10
+    monitoring:
+      feature_drift_metric: PSI
+      drift_threshold: 0.2
+      prediction_spike_threshold_pct: 15   # tighter — business impact higher
+      alert_channel: "#ml-alerts"
+
+# ── LINEAGE REQUIREMENTS ───────────────────────────────────────────────────────
+# Every model version registered in any stage MUST record these fields.
+# Registration will be rejected (via pre-commit hook in CI) if any are absent.
+
+lineage:
+  required_fields:
+    - git_sha
+      # Full 40-character SHA of the training code commit.
+      # Tags like "v1.2.0" are rejected — they are mutable.
+
+    - dataset_hash
+      # SHA-256 of the concatenated Parquet files in the training split,
+      # computed by scripts/hash_dataset.py before training begins.
+      # Stored in S3 alongside the dataset snapshot at
+      # s3://northstar-data/snapshots/{dataset_hash}/
+
+    - split_manifest_hash
+      # SHA-256 of split_manifest.json (the frozen eval-set definition).
+      # Ensures eval set cannot be silently changed between runs.
+
+    - docker_image_sha
+      # Full sha256 digest of the training Docker image from ECR.
+      # e.g. "sha256:3a7f9c…"  — not a mutable tag like "latest".
+
+    - mlflow_run_id
+      # UUID of the MLflow experiment run that produced this model.
+      # Links back to all logged parameters, metrics, and artifacts.
+
+    - training_duration_seconds
+      # Wall-clock time of the training job. Anomalous values
+      # (< 60 s or > 24 h) trigger a Slack warning but do not block.
+
+  optional_fields:
+    - feature_store_version
+      # If a versioned feature store is adopted later, pin the snapshot ID.
+    - hyperparameter_search_run_id
+      # If HPO is run, reference the parent sweep run_id.
